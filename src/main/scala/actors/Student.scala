@@ -2,9 +2,8 @@ package actors
 
 import akka.actor.{ActorRef, Props, Actor}
 
+import models.Models._
 
-object XmlPayload { def apply() = new XmlPayload {}}
-trait XmlPayload
 
 object Student {
 
@@ -21,15 +20,10 @@ object Student {
 }
 
 
-
-trait StudentDomainService {
-
-  def loadActivities(studentId: Long, courseId: Long): Seq[Long] = Seq(1, 2, 3)
-}
-
-
-//This is more like an aggregate(DDD)
-//TODO: Should be a persistentActor
+//This is an aggregate represents everything about Student, its gradebook and activities
+//Activities are represented as an child actor (in-memory model). This extends
+//StudenDomainService trait to access all the domain specific services
+//Right now this is quite simple as all the events generated to default Akka event stream
 class Student extends Actor with StudentDomainService {
 
   import Student._
@@ -77,12 +71,16 @@ object Activity {
   case class ActivityData(studentId: Long, activityId: Long, p: XmlPayload, score: Option[Double])
 
 
+  //event published whenever activity is changed.
   case class ActivityUpdated(studentId: Long, activityId: Long, completionPercentage: Double)
 
 
   def props = Props(new Activity)
 }
 
+
+//Represents each activity assigned to a student. This will be a stateful actor backed
+//by some persistent journal.
 //TODO: This should be persistentActor
 class Activity extends Actor {
 
@@ -99,7 +97,6 @@ class Activity extends Actor {
       payload = newPayload
       score = newScore
       val completionPercentage = calculateCompletion(payload)
-      println(s">>>>>>>>>>>>>>>>>>>>>> Firing event for $studentId $activityId")
       context.system.eventStream.publish(ActivityUpdated(studentId, activityId, completionPercentage))
   }
 

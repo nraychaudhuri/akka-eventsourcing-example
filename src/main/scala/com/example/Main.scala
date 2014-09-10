@@ -1,7 +1,9 @@
 package com.example
 
-import actors.{XmlPayload, Teacher, Student}
+import actors.{Teacher, Student}
 import akka.actor.ActorSystem
+
+import models.Models._
 
 object Main {
   def main(args: Array[String]): Unit = {
