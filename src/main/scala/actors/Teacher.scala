@@ -26,8 +26,6 @@ object TeacherGradeBook {
 
 class TeacherGradeBook extends Actor {
 
-  //TODO: subscribing to event stream. This is a naive example. In real world
-  //we will replace this with akka journal and views
   context.system.eventStream.subscribe(self, classOf[Activity.ActivityUpdated])
 
   override def receive = {

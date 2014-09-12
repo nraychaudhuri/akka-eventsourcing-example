@@ -1,73 +1,89 @@
 package actors
 
 import akka.actor.{ActorRef, Props, Actor}
+import akka.persistence.PersistentActor
 
 import models.Models._
+
+import scala.util.{Success, Failure}
 
 
 object Student {
 
   //commands
-  case class CourseAssignment(studentId: Long, courseId: Long)
-  case class LoadActivity(studentId: Long, activityId: Long)
-  case class UpdateActivity(studentId: Long, activityId: Long, p: XmlPayload, score: Option[Double] = None)
+  case class CourseAssignment(courseId: Long)
+  case class LoadActivity(activityId: Long)
+  case class UpdateActivity(activityId: Long, p: XmlPayload, score: Option[Double] = None)
 
   //events
   case class CourseIsAssigned(studentId: Long, courseId: Long)
   case class ActivityAccessed(studentId: Long, activityId: Long)
 
-  def props = Props(new Student)
+  def props(studentId: Long) = Props(new Student(studentId))
 }
 
 
-//This is an aggregate represents everything about Student, its gradebook and activities
-//Activities are represented as an child actor (in-memory model). This extends
-//StudenDomainService trait to access all the domain specific services
-//Right now this is quite simple as all the events generated to default Akka event stream
-class Student extends Actor with StudentDomainService {
+class Student(studentId: Long) extends PersistentActor with StudentDomainService {
 
   import Student._
 
+  //internal state
+  var courseId: Long = _
+  var lastActivityAccessedId: Long = _
 
-  //we can directly access db to access all the activity stuff but lets take this one step further and have them as
-  //as a child actors to student
-  //Ideally it should be student -> course[1..*] -> activity[1..*] Here it is simplified
-  override def receive = {
+  override val persistenceId = s"student-$studentId-flow"
 
-    case CourseAssignment(studentId, courseId: Long) =>
-      loadActivities(studentId, courseId).foreach(createActivity)
-      //create grade book for the course
-      context.actorOf(StudentGradeBook.props(studentId), "grade-book")
-      //firing event
-      context.system.eventStream.publish(CourseIsAssigned(studentId, courseId))
 
-    case LoadActivity(studentId, activityId) =>
-       lookUpActivity(activityId).foreach(_.forward(Activity.Get(studentId, activityId)))
-
-       //firing event
-       context.system.eventStream.publish(ActivityAccessed(studentId, activityId))
-
-    case UpdateActivity(studentId, activityId, payload, score) =>
-      lookUpActivity(activityId).foreach(_.forward(Activity.Update(studentId, activityId, payload, score)))
+  override def receiveRecover: Receive = {
+    case e: CourseIsAssigned => updateCourseId(e)
+    case e: ActivityAccessed => updateLastActivityId(e)
   }
 
 
+  override def preStart(): Unit = {
+    super.preStart()
+    context.actorOf(StudentGradeBook.props(studentId), "grade-book")
+  }
 
-  def lookUpActivity(activityId: Long): Option[ActorRef] = {
-    context.child(s"activity-$activityId")
+
+  override def receiveCommand = {
+
+    case CourseAssignment(courseId: Long) =>
+      loadActivities(studentId, courseId).foreach(activityId => createActivity(activityId, studentId))
+      persist(CourseIsAssigned(studentId, courseId))(updateCourseId)
+
+    case LoadActivity(activityId) =>
+       lookUpActivity(activityId, studentId).foreach(_.forward(Activity.Get))
+      persist(ActivityAccessed(studentId, activityId))(updateLastActivityId)
+
+    case UpdateActivity(activityId, payload, score) =>
+      lookUpActivity(activityId, studentId).foreach(_.forward(Activity.Update(payload, score)))
+  }
+
+
+  private def updateCourseId(e: CourseIsAssigned) = {
+    courseId = e.courseId
+  }
+
+  private def updateLastActivityId(e: ActivityAccessed) = {
+    lastActivityAccessedId = e.activityId
+  }
+
+  private def lookUpActivity(activityId: Long, studentId: Long): Option[ActorRef] = {
+    context.child(s"activity-$studentId-$activityId")
   }
 
   //creating each activity as a child actor
-  def createActivity(activityId: Long): ActorRef = {
-    context.actorOf(Activity.props, name=s"activity-$activityId")
+  private def createActivity(activityId: Long, studentId: Long): ActorRef = {
+    context.actorOf(Activity.props(activityId, studentId), name=s"activity-$studentId-$activityId")
   }
 }
 
 
 object Activity {
 
-  case class Get(studentId: Long, activityId: Long)
-  case class Update(studentId: Long, activityId: Long, p: XmlPayload, score: Option[Double] = None)
+  case object Get
+  case class Update(p: XmlPayload, score: Option[Double] = None)
   case class ActivityData(studentId: Long, activityId: Long, p: XmlPayload, score: Option[Double])
 
 
@@ -75,29 +91,59 @@ object Activity {
   case class ActivityUpdated(studentId: Long, activityId: Long, completionPercentage: Double)
 
 
-  def props = Props(new Activity)
+  def props(activityId: Long, studentId: Long) = Props(new Activity(activityId, studentId))
 }
 
 
-//Represents each activity assigned to a student. This will be a stateful actor backed
-//by some persistent journal.
-//TODO: This should be persistentActor
-class Activity extends Actor {
+class Activity(activityId: Long, studentId: Long) extends PersistentActor {
 
   import Activity._
+  import scala.concurrent.ExecutionContext.Implicits.global
+
+  override val persistenceId = s"activity-$studentId-$activityId"
+
+
+  override def receiveRecover: Receive = {
+    case ActivityUpdated(_, _, percentage) =>
+      println(s"Inside the recover block of $studentId-$activityId")
+      completionPercentage = percentage
+      loadFromDatabase(activityId, studentId)
+  }
+
 
   //this state would be loaded from some persistent storage
   var payload: XmlPayload = new XmlPayload {}
   var score: Option[Double] = None
+  var completionPercentage: Double = _
 
 
-  override def receive = {
-    case Get(studentId, activityId) => sender() ! ActivityData(studentId, activityId, payload, score)
-    case Update(studentId, activityId, newPayload, newScore) =>
-      payload = newPayload
-      score = newScore
-      val completionPercentage = calculateCompletion(payload)
-      context.system.eventStream.publish(ActivityUpdated(studentId, activityId, completionPercentage))
+  override def receiveCommand = {
+    case Get =>
+      sender() ! ActivityData(studentId, activityId, payload, score)
+
+    case Update(newPayload, newScore) =>
+      updateDatabase(payload, score)
+      persist(ActivityUpdated(studentId, activityId, calculateCompletion(payload))) { e =>
+        //perform side-effecting operation
+        payload = newPayload
+        score = newScore
+        completionPercentage = e.completionPercentage
+        context.system.eventStream.publish(e)
+      }
+
+  }
+
+
+
+  import scala.concurrent.Future
+  private def updateDatabase(payload: XmlPayload, score: Option[Double]): Future[Boolean] = {
+    //save the information in the write database
+    Future.successful(true)
+  }
+
+  private def loadFromDatabase(activityId: Long, studentId: Long): Future[Boolean] = {
+    //load payload and score from database
+    Future.successful(true)
   }
 
   def calculateCompletion(payload: XmlPayload): Double = 20
