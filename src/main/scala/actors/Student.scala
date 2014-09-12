@@ -1,7 +1,7 @@
 package actors
 
 import akka.actor.{ActorRef, Props, Actor}
-import akka.persistence.PersistentActor
+import akka.persistence.{PersistentView, PersistentActor}
 
 import models.Models._
 
@@ -18,6 +18,7 @@ object Student {
   //events
   case class CourseIsAssigned(studentId: Long, courseId: Long)
   case class ActivityAccessed(studentId: Long, activityId: Long)
+  case class ActivityUpdated(studentId: Long, activityId: Long, completionPercentage: Double)
 
   def props(studentId: Long) = Props(new Student(studentId))
 }
@@ -30,6 +31,7 @@ class Student(studentId: Long) extends PersistentActor with StudentDomainService
   //internal state
   var courseId: Long = _
   var lastActivityAccessedId: Long = _
+  var progress: Double = _
 
   override val persistenceId = s"student-$studentId-flow"
 
@@ -37,6 +39,7 @@ class Student(studentId: Long) extends PersistentActor with StudentDomainService
   override def receiveRecover: Receive = {
     case e: CourseIsAssigned => updateCourseId(e)
     case e: ActivityAccessed => updateLastActivityId(e)
+    case e: ActivityUpdated => updateProgress(e)
   }
 
 
@@ -54,12 +57,23 @@ class Student(studentId: Long) extends PersistentActor with StudentDomainService
 
     case LoadActivity(activityId) =>
        lookUpActivity(activityId, studentId).foreach(_.forward(Activity.Get))
-      persist(ActivityAccessed(studentId, activityId))(updateLastActivityId)
+       persist(ActivityAccessed(studentId, activityId))(updateLastActivityId)
 
     case UpdateActivity(activityId, payload, score) =>
       lookUpActivity(activityId, studentId).foreach(_.forward(Activity.Update(payload, score)))
+
+    case Activity.ActivityIsUpdated(activityId, percentage) =>
+      persist(ActivityUpdated(studentId, activityId, percentage)) { e =>
+        updateProgress(e)
+        //for who ever interested
+        context.system.eventStream.publish(e)
+      }
   }
 
+
+  private def updateProgress(e: ActivityUpdated) = {
+    progress = 20
+  }
 
   private def updateCourseId(e: CourseIsAssigned) = {
     courseId = e.courseId
@@ -87,50 +101,44 @@ object Activity {
   case class ActivityData(studentId: Long, activityId: Long, p: XmlPayload, score: Option[Double])
 
 
-  //event published whenever activity is changed.
-  case class ActivityUpdated(studentId: Long, activityId: Long, completionPercentage: Double)
+  case class ActivityIsUpdated(activityId: Long, completionPercentage: Double)
 
 
   def props(activityId: Long, studentId: Long) = Props(new Activity(activityId, studentId))
 }
 
 
-class Activity(activityId: Long, studentId: Long) extends PersistentActor {
+class Activity(activityId: Long, studentId: Long) extends Actor {
 
   import Activity._
   import scala.concurrent.ExecutionContext.Implicits.global
-
-  override val persistenceId = s"activity-$studentId-$activityId"
-
-
-  override def receiveRecover: Receive = {
-    case ActivityUpdated(_, _, percentage) =>
-      println(s"Inside the recover block of $studentId-$activityId")
-      completionPercentage = percentage
-      loadFromDatabase(activityId, studentId)
-  }
-
 
   //this state would be loaded from some persistent storage
   var payload: XmlPayload = new XmlPayload {}
   var score: Option[Double] = None
   var completionPercentage: Double = _
 
+  //this is will restore state incase of crash
+  override def preStart(): Unit = {
+    super.preStart()
+    loadFromDatabase(activityId, studentId)
+  }
 
-  override def receiveCommand = {
+
+  override def receive = {
     case Get =>
       sender() ! ActivityData(studentId, activityId, payload, score)
 
     case Update(newPayload, newScore) =>
-      updateDatabase(payload, score)
-      persist(ActivityUpdated(studentId, activityId, calculateCompletion(payload))) { e =>
-        //perform side-effecting operation
-        payload = newPayload
-        score = newScore
-        completionPercentage = e.completionPercentage
-        context.system.eventStream.publish(e)
+      updateDatabase(payload, score).onComplete {
+        case Success(_) =>
+          //perform side-effecting operation
+          payload = newPayload
+          score = newScore
+          completionPercentage = calculateCompletion(payload)
+          context.parent ! ActivityIsUpdated(activityId, completionPercentage)
+        case Failure(t) => t.printStackTrace()
       }
-
   }
 
 
@@ -160,16 +168,19 @@ object StudentGradeBook {
 }
 
 //This could be persistent as well
-class StudentGradeBook(studentId: Long) extends Actor {
+class StudentGradeBook(studentId: Long) extends Actor with PersistentView {
 
   import StudentGradeBook._
+
+  override def persistenceId: String = s"student-$studentId-flow"
+
+  override def viewId: String = s"student-$studentId-flow-view"
+
   //state
   var gradeBookState: Any = _
 
-  context.system.eventStream.subscribe(self, classOf[Activity.ActivityUpdated])
-
   override def receive = {
-    case Activity.ActivityUpdated(id, activityId, completionPercentage) if studentId == id =>
+    case Student.ActivityUpdated(id, activityId, completionPercentage) if studentId == id =>
       println(s">>>>>> student grade book $studentId $activityId")
       //update the grade book state
 

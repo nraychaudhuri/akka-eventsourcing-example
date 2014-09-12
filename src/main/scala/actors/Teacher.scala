@@ -26,10 +26,10 @@ object TeacherGradeBook {
 
 class TeacherGradeBook extends Actor {
 
-  context.system.eventStream.subscribe(self, classOf[Activity.ActivityUpdated])
+  context.system.eventStream.subscribe(self, classOf[Student.ActivityUpdated])
 
   override def receive = {
-    case Activity.ActivityUpdated(studentId, activityId, completionPercentage) =>
+    case Student.ActivityUpdated(studentId, activityId, completionPercentage) =>
       println(s">>>>>> teacher grade book $studentId $activityId")
   }
 }
